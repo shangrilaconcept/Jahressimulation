@@ -1,0 +1,7 @@
+openmeteo-requests>=0.3.0
+requests-cache>=1.0.0
+retry-requests>=2.0.0
+pandas>=2.0.0
+pytz>=2024.1
+requests>=2.31.0
+click>=8.1.0
