@@ -3,7 +3,7 @@ pv_*_cache.csv
 .cache_pv_*/
 .cache_main*/
 
-# Ergebnisdateien (gross, lokal generiert)
+# Ergebnisdateien (gross, lokal generiert – nicht einchecken)
 ergebnis_szenario_*.csv
 monatlich_szenario_*.csv
 kpi_jahresvergleich.csv

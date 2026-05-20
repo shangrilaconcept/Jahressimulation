@@ -39,16 +39,24 @@ ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 def load_year_prices(config) -> pd.DataFrame:
     """
-    Laedt stuendliche Grosshandelspreise aus der Jahres-CSV.
-    Erwartet mindestens eine Zeitspalte und eine Preisspalte.
-    Gibt DataFrame mit Spalten [start_time, marketprice_ct_per_kwh] zurueck.
+    Laedt Grosshandelspreise aus der Jahres-CSV und gibt einen stuendlichen
+    DataFrame mit Spalten [start_time, marketprice_ct_per_kwh] zurueck.
+
+    Unterstuetzt:
+    - SMARD-Export (Semikolon, deutsches Datum dd.mm.yyyy HH:MM, 15-min-Aufloesung)
+    - ISO-CSV (Komma oder Semikolon, yyyy-mm-dd, stuendlich oder 15-min)
+    - Preise in €/MWh oder ct/kWh – wird automatisch erkannt
+    15-Minuten-Daten werden auf Stundenmittelwerte resamplet.
     """
     csv_path = resolve_data_path(config, "year_price_file")
 
     df = None
     for sep in [";", ",", "\t"]:
         try:
-            candidate = pd.read_csv(csv_path, sep=sep, engine="python", encoding="utf-8-sig")
+            candidate = pd.read_csv(
+                csv_path, sep=sep, engine="python",
+                encoding="utf-8-sig", thousands=None,
+            )
             if len(candidate.columns) >= 2:
                 df = candidate
                 break
@@ -59,51 +67,66 @@ def load_year_prices(config) -> pd.DataFrame:
 
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # Zeitspalte ermitteln
+    # Zeitspalte ermitteln (bevorzuge "datum von" / "start" ueber "bis"-Spalten)
     dt_col = next(
         (c for c in df.columns if any(k in c for k in
-            ["datum", "date", "start", "zeit", "time", "timestamp"])),
+            ["datum von", "start", "datum", "date", "zeit", "time", "timestamp"])
+         and "bis" not in c),
         df.columns[0],
     )
-    # Preisspalte ermitteln
+    # Preisspalte ermitteln – bevorzuge ct/kWh, sonst €/MWh
     price_col = next(
-        (c for c in df.columns if any(k in c for k in
-            ["preis", "price", "mwh", "kwh", "market", "wert", "value", "eur"])),
-        df.columns[1],
+        (c for c in df.columns if "ct/kwh" in c or "ct_kwh" in c),
+        None,
     )
-
-    # Datum parsen – ISO-Format mit flexiblem Fallback
-    df["start_time"] = pd.to_datetime(df[dt_col], dayfirst=False, errors="coerce")
-    # Fallback: deutsches Format dd.mm.yyyy
-    bad_mask = df["start_time"].isna()
-    if bad_mask.any():
-        df.loc[bad_mask, "start_time"] = pd.to_datetime(
-            df.loc[bad_mask, dt_col], dayfirst=True, errors="coerce"
+    if price_col is None:
+        price_col = next(
+            (c for c in df.columns if any(k in c for k in
+                ["€/mwh", "eur/mwh", "mwh", "preis", "price", "market", "wert", "value"])),
+            df.columns[1],
         )
 
-    # Preis parsen: Komma → Punkt (deutsche Notation), Einheit auto-erkennen
+    # Datum parsen – deutsches Format (dayfirst=True) deckt auch ISO ab
+    def parse_col(series):
+        parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
+        if parsed.isna().mean() > 0.5:
+            parsed = pd.to_datetime(series, dayfirst=False, errors="coerce")
+        return parsed
+
+    df["start_time"] = parse_col(df[dt_col])
+
+    # Preis parsen: Komma-Dezimal + Tausenderpunkt (deutsches Format)
     raw = df[price_col].astype(str).str.strip()
     raw = raw.apply(lambda s: re.sub(r"[€$\s]", "", s))
-    # Tausendertrennzeichen entfernen wenn Format "1.234,56" erkannt
     raw = raw.apply(
-        lambda s: s.replace(".", "").replace(",", ".") if "," in s and "." in s
+        lambda s: s.replace(".", "").replace(",", ".") if ("," in s and "." in s)
         else s.replace(",", ".")
     )
     df["marketprice_ct_per_kwh"] = pd.to_numeric(
         raw.str.extract(r"([-+]?\d*\.?\d+)", expand=False), errors="coerce"
     )
 
-    df = df[["start_time", "marketprice_ct_per_kwh"]].dropna().sort_values("start_time").reset_index(drop=True)
+    df = df[["start_time", "marketprice_ct_per_kwh"]].dropna().sort_values("start_time")
 
-    # Einheit: €/MWh → ct/kWh (typische 2025-Preise 40–150 €/MWh → Median > 15)
+    # Einheit erkennen: €/MWh (Median > 10) → in ct/kWh umrechnen (÷10)
+    # ct/kWh direkt (SMARD-Spalte hat typisch 0–30 ct/kWh)
     median_val = df["marketprice_ct_per_kwh"].abs().median()
-    if median_val > 15:
+    if median_val > 10:
         df["marketprice_ct_per_kwh"] = df["marketprice_ct_per_kwh"] / 10.0
-        print(f"  [Preise] Einheit €/MWh erkannt (Median {median_val:.1f}) → Umrechnung auf ct/kWh")
+        print(f"  [Preise] Einheit €/MWh erkannt (Median {median_val:.1f}) → ÷10 → ct/kWh")
     else:
-        print(f"  [Preise] Einheit ct/kWh erkannt (Median {median_val:.2f})")
+        print(f"  [Preise] Einheit ct/kWh erkannt (Median {median_val:.3f} ct/kWh)")
 
-    return df
+    # Auf Stundenwerte resamplen falls hoehere Aufloesung (z.B. 15-Minuten)
+    df = df.set_index("start_time")
+    rows_per_hour = df.resample("h").count()["marketprice_ct_per_kwh"].median()
+    if rows_per_hour > 1:
+        df = df.resample("h").mean()
+        print(f"  [Preise] {int(60 / rows_per_hour)}-min-Aufloesung erkannt → auf Stundenmittel resamplet")
+
+    df = df.reset_index().rename(columns={"index": "start_time"})
+    df.columns = ["start_time", "marketprice_ct_per_kwh"]
+    return df.dropna().reset_index(drop=True)
 
 
 # ── PV-Jahresdaten aus Open-Meteo Archiv laden ────────────────────────────────
